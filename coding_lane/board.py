@@ -74,6 +74,12 @@ def block(conn, task_id, run_id, reason, kind):
     return kb.block_task(conn, task_id, reason=reason, kind=kind, expected_run_id=run_id)
 
 
+def park(conn, task_id, run_id, reason):
+    """an operator stop. scheduled, unlike blocked, does not count toward hermes's block-loop limit"""
+    kb.add_comment(conn, task_id, AUTHOR, f"parked: {reason}")
+    return kb.schedule_task(conn, task_id, reason=reason, expected_run_id=run_id)
+
+
 def request_review(conn, task_id, run_id, summary, metadata):
     return kb.request_review(conn, task_id, summary=summary, metadata=metadata,
                              expected_run_id=run_id, with_reason=True)

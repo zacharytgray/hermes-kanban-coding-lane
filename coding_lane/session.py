@@ -27,3 +27,12 @@ def events_path(task_id, board_slug=None):
 
 def stop_path(task_id, board_slug=None):
     return board.state_dir(task_id, board_slug) / "stop-request"
+
+
+def prompt_path(task_id, board_slug=None):
+    return board.state_dir(task_id, board_slug) / "prompt.txt"
+
+
+def steered_path(task_id, board_slug=None):
+    """touched by every operator message, so the supervisor knows someone answered"""
+    return board.state_dir(task_id, board_slug) / "steered"

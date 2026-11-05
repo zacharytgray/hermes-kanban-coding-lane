@@ -23,6 +23,8 @@ def _card_status(task_id, board):
         task = kanban.get_task(conn, task_id)
     if task is None:
         raise LaneError(f"no such task: {task_id}")
+    if task.assignee not in AGENTS:
+        raise LaneError(f"{task_id} is assigned to {task.assignee}, not to a lane agent")
     return task.status
 
 
@@ -62,6 +64,8 @@ def send(task_id, message, board=None):
         raise LaneError(f"{task_id} is waiting at a dialog, and an enter would answer it. "
                         f"open the session or stop it: {tmux.attach_command(name)}")
     result = tmux.deliver(name, f"Note from the operator: {message}")
+    if result == "sent":
+        store.steered_path(task_id, board).touch()
     with kanban.connect(board) as conn:
         kanban.comment(conn, task_id, f"operator message, delivery {result}: {message[:500]}")
     # unknown can also mean the message finished the work and the session closed
@@ -78,20 +82,22 @@ def stop(task_id, reason="", board=None):
     while time.monotonic() < deadline:
         current = _card_status(task_id, board)
         if current != "running":
-            return {"ok": True, "status": current}
+            return {"ok": current == "scheduled", "status": current}
         time.sleep(0.5)
     return {"ok": False, "status": "running", "error": "the supervisor has not stopped it yet"}
 
 
 def resume(task_id, message="", board=None):
-    """unblock the card. the next claim reopens the same cli session."""
+    """unblock a stopped or blocked card. the next claim reopens the same cli session."""
+    current = _card_status(task_id, board)
+    if current == "triage":
+        raise LaneError(f"{task_id} is in triage, where hermes puts a card blocked twice for the same "
+                        "reason. a person decides what happens next")
+    if current not in ("blocked", "scheduled"):
+        raise LaneError(f"{task_id} is {current}. only a stopped or blocked card resumes here")
     found = store.load(task_id, board)
+    store.stop_path(task_id, board).unlink(missing_ok=True)
     with kanban.connect(board) as conn:
-        task = kanban.get_task(conn, task_id)
-        if task is None:
-            raise LaneError(f"no such task: {task_id}")
-        if task.status != "blocked":
-            raise LaneError(f"{task_id} is {task.status}. only a blocked card resumes here")
         if message and found is None:
             raise LaneError(f"{task_id} never opened a session, so there is nothing to give the message to. "
                             "resume it without one, or edit the card")

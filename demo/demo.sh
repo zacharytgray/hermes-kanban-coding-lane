@@ -23,7 +23,7 @@ if [ "$who" = fake ]; then
   export CLAUDE_CONFIG_DIR="$dir/claude"
   agent_config="claude: {bin: $root/tests/fake_agent.py}"
 elif [ "$who" = claude-code ]; then
-  agent_config="claude: {model: ${LANE_DEMO_CLAUDE_MODEL:-haiku}, allowed_tools: [Write, Edit, Read, 'Bash(python3 -c *)']}"
+  agent_config="claude: {model: ${LANE_DEMO_CLAUDE_MODEL:-haiku}, allowed_tools: [Write, Edit, Read, 'Bash(python3 -c *)', 'Bash(cat *)', 'Bash(ls *)', 'Bash(git status *)', 'Bash(git diff *)']}"
 fi
 cat > "$HERMES_HOME/config.yaml" <<YAML
 plugins:
@@ -97,14 +97,14 @@ wait_status review
 hermes kanban show "$card" | sed -n '/Runs/,$p'
 git -C "$repo" show "wt/$card:${shown_file:-HELLO.txt}"
 
-say "stop a second card mid-run. it goes to blocked and keeps its session"
+say "stop a second card mid-run. it is parked and keeps its session"
 card=$(new_card "Write BYE.txt" "$slow Then create BYE.txt containing the word bye. scenario=wait")
 echo "$card"
 tick
 wait_status running 30
 sleep "${LANE_DEMO_SETTLE:-8}"
 hermes coding-lane stop "$card" "changing the brief"
-wait_status blocked 30
+wait_status scheduled 30
 
 say "resume it with a new instruction, in the same cli session"
 hermes coding-lane resume "$card" "Put the word goodbye in BYE.txt instead of bye, and skip the slow command."

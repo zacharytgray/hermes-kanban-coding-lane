@@ -32,7 +32,7 @@ Hermes already has a route to these CLIs. Kanban cards can carry `--skill claude
 | Resume the same CLI session after a stop | Up to the model | Only goal-mode turns, as far as I read | Yes |
 | CLIs covered | Those with a skill | Claude Code, Codex, OpenCode, Qoder | Claude Code and Codex |
 | Setup | A profile and a model | Plugin, settings page | Plugin, tmux |
-| Size | Part of Hermes | About 9,000 lines | About 1,100 lines |
+| Size | Part of Hermes | About 9,000 lines | About 1,200 lines |
 | How it hooks into dispatch | Native | Replaces the spawn default | Tick hook and kernel calls |
 
 In one real run of `--skill claude-code` on Hermes v0.22.5, I commented on the card while a foreground `claude -p` was running. The CLI finished its original instruction. The comment then reached the Hermes model as a mid-run note, and the model started more `claude -p` runs to fix the file. The result was correct. The worker was steered, but the CLI process was not. I used a small local model for that test, so it says nothing about how well a stronger model would drive the CLI. I read the skill's tmux mode but did not test it.
@@ -76,7 +76,7 @@ Do not create Hermes profiles named `claude-code` or `codex`. The dispatcher wou
 hermes kanban create "Add a health check" --assignee codex --workspace worktree:/path/to/repo --body "..."
 hermes coding-lane status
 hermes coding-lane send <task> "Use the existing router instead."
-hermes coding-lane stop <task> "Changing the brief"
+hermes coding-lane stop <task> "Changing the brief"   # parks the card as scheduled
 hermes coding-lane resume <task> "New brief is in the card."
 ```
 
@@ -105,7 +105,8 @@ By default, only the chat tools and `hermes coding-lane send` reach a live CLI. 
 - A listed comment reaches the CLI labelled with its author and a note that the label is not verified.
 - Control characters are removed before pasting, so text cannot end the paste early and run as keystrokes.
 - Every message is prefixed, so a leading `/` or `!` cannot run as a CLI command.
-- A message is refused while the session shows a numbered dialog, since the Enter would answer it.
+- A message is held while the session shows a dialog, since the Enter would answer it. The lane checks again right before each Enter. It knows a dialog by a numbered selected row or by the confirm footer the CLI draws under it.
+- Each message uses its own tmux paste buffer, so two messages sent at once cannot swap sessions.
 
 Card text is still input to the agent. The first prompt uses Hermes's own worker context, which includes the card body and any comments already on it. A resumed session gets every comment since it stopped, from any author, so that review notes reach it. The prompt tells the agent that this text is context, but that is only a request to a model and not a security control. Treat anyone who can write to your board as someone who can instruct your agent.
 
@@ -132,6 +133,9 @@ The lane never passes `--dangerously-skip-permissions` or `--dangerously-bypass-
 | Agent waits for a person past `idle_seconds` | Stops the session | `blocked`, kind `needs_input` |
 | CLI exits with no status | Stops watching | `blocked`, kind `needs_input` |
 | Claim lost, or max runtime reached | Ends the session | Whatever Hermes decided |
+| Operator stop | Ends the session | `scheduled`, which Hermes does not count as a block loop |
+
+Hermes sends a card to `triage` when it is blocked twice for the same reason with an unblock in between. That applies to lane cards too, for example a second usage limit after a resume. The lane does not try to undo that. A person moves the card on from `triage`.
 
 Auth and quota errors are read from pane text only on a pane that has ended or gone quiet. Claude Code's `StopFailure` hook is also used. A quiet pane showing a matching phrase, such as a long test run that printed "rate limit exceeded", can block a card by mistake. Resuming it is safe.
 
@@ -180,9 +184,11 @@ HERMES_SOURCE=/path/to/hermes-agent ~/.hermes/hermes-agent/venv/bin/python -m un
 
 Versions were Hermes v0.22.5 and main at `84a0301415`, Claude Code 2.1.318, Codex 0.166.0, and tmux 3.6b, on macOS.
 
-- All 37 tests pass on both Hermes versions.
+- All 45 tests pass on both Hermes versions.
 - Real Claude Code and real Codex each completed the demo. That covers a mid-run message, review, stop, and resume in the same session id.
 - A real Claude Code process killed with `kill -9` was recorded as a crash, retried in the same session, and reached review.
+- In one real Claude Code run, a command outside the allowlist raised a permission prompt. The lane commented on the card and approved nothing.
+- Real trust prompts were seen on both CLIs. Codex ignores a `-c projects` trust override, which is why the lane does not rely on one.
 - Under a real gateway with a fake CLI, the tick claimed a card within seconds. `kill -9` on the supervisor was recorded as a crash, and the next run adopted the live session.
 - A real Hermes model turn called `coding_lane_send`, and the message reached a fake CLI session.
 - Empty CLI config directories blocked real Claude Code and real Codex with `capability`.

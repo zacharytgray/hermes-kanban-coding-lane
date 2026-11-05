@@ -76,11 +76,12 @@ class LaneTest(unittest.TestCase):
         with board.connect() as conn:
             return [t for a in agents.AGENTS for t in kb.list_tasks(conn, assignee=a)]
 
-    def card(self, scenario, assignee="claude-code", **kwargs):
+    def card(self, scenario, assignee="claude-code", extra="", **kwargs):
         kwargs.setdefault("workspace_kind", "worktree")
         kwargs.setdefault("workspace_path", self.repo)
         with board.connect() as conn:
-            return kb.create_task(conn, title=f"do {scenario}", body=f"scenario={scenario}", assignee=assignee, **kwargs)
+            return kb.create_task(conn, title=f"do {scenario}", body=f"scenario={scenario}{extra}", assignee=assignee,
+                                  **kwargs)
 
     def task(self, task_id):
         with board.connect() as conn:
@@ -212,6 +213,30 @@ class Steering(LaneTest):
         self.assertFalse((worktree / "fake.txt").exists())
         wait_for(lambda: any("waiting at" in c for c in self.comments(task_id)), what="dialog comment")
 
+    def test_a_long_card_and_a_long_message_get_through(self):
+        task_id = self.card("wait", extra="\n" + "x" * 7000)
+        with board.connect() as conn:
+            for i in range(12):
+                kb.add_comment(conn, task_id, "user", f"context {i} " + "y" * 1900)
+        self.assertIn(task_id, spawn.tick())
+        self.session_up(task_id)
+        reply = control.send(task_id, "z" * 20000 + " end of a long note")
+        self.assertIn(reply["delivery"], ("sent", "unknown"), reply)
+        self.assertIn("end of a long note", (self.worktree(task_id) / "fake.txt").read_text())
+
+    def test_two_sessions_get_their_own_messages(self):
+        first, second = self.start("wait"), self.start("wait")
+        self.session_up(first)
+        self.session_up(second)
+        import threading
+        sends = [threading.Thread(target=control.send, args=(t, f"message for {t}")) for t in (first, second)]
+        [s.start() for s in sends]
+        [s.join() for s in sends]
+        for mine, other in ((first, second), (second, first)):
+            text = (self.worktree(mine) / "fake.txt").read_text()
+            self.assertIn(f"message for {mine}", text)
+            self.assertNotIn(f"message for {other}", text)
+
     def test_control_characters_cannot_escape_the_paste(self):
         self.assertEqual(tmux.clean("a\x1b[201~b\x03c\nd"), "a[201~bc\nd")
 
@@ -249,7 +274,7 @@ class StopAndResume(LaneTest):
                     found["session_id"] = "thread-1"
                     store.save(found)
                 self.assertTrue(control.stop(task_id, "going another way")["ok"])
-                self.assertEqual(self.task(task_id).status, "blocked")
+                self.assertEqual(self.task(task_id).status, "scheduled")
                 self.assertFalse(tmux.exists(found["tmux"]))
 
                 self.assertTrue(control.resume(task_id, "try the other way")["started"])
@@ -278,6 +303,34 @@ class StopAndResume(LaneTest):
         self.assertIn(first, saved["args"])
         self.assertIn("the reviewer wants more tests", saved["prompt"])
 
+    def test_stopping_twice_does_not_trip_the_block_loop_limit(self):
+        task_id = self.start("wait")
+        for _ in range(3):
+            self.session_up(task_id)
+            self.assertEqual(control.stop(task_id, "again")["status"], "scheduled")
+            self.assertTrue(control.resume(task_id, "keep waiting")["started"])
+        self.assertEqual(self.task(task_id).status, "running")
+
+    def test_resume_refuses_a_card_that_is_not_a_lane_card(self):
+        with board.connect() as conn:
+            task_id = kb.create_task(conn, title="native", assignee="someone")
+            kb.block_task(conn, task_id, reason="needs a person", kind="needs_input")
+        with self.assertRaises(control.LaneError):
+            control.resume(task_id)
+        self.assertEqual(self.task(task_id).status, "blocked")
+
+    def test_card_moved_to_the_other_cli_starts_a_new_session(self):
+        task_id = self.start("wait")
+        self.session_up(task_id)
+        control.stop(task_id)
+        with board.connect() as conn:
+            kb.assign_task(conn, task_id, "codex")
+        self.assertTrue(control.resume(task_id)["started"])
+        found = wait_for(lambda: (store.load(task_id) or {}).get("agent") == "codex" and store.load(task_id))
+        self.assertEqual(found["agent"], "codex")
+        self.session_up(task_id)
+        self.assertEqual(self.task(task_id).status, "running")
+
     def test_resume_refuses_a_running_card(self):
         task_id = self.start("wait")
         self.session_up(task_id)
@@ -303,8 +356,18 @@ class Failures(LaneTest):
     def test_auth_error_at_exit_blocks_without_retry(self):
         self.assert_blocked(self.start("auth"), "capability", "not authenticated")
 
+    def test_trust_words_in_the_card_are_not_a_trust_prompt(self):
+        task_id = self.card("wait")
+        with board.connect() as conn:
+            kb.add_comment(conn, task_id, "user", "the dialog says Trust this folder? when it starts")
+        self.assertIn(task_id, spawn.tick())
+        self.session_up(task_id)
+        time.sleep(2)
+        self.assertEqual(self.task(task_id).status, "running")
+
     def test_untrusted_repo_blocks_by_default(self):
         self.assert_blocked(self.start("trust"), "capability", "does not trust this repo")
+        self.assert_blocked(self.start("trust_claude"), "capability", "does not trust this repo")
 
     def test_auto_trust_answers_the_prompt(self):
         write_settings(auto_trust=True)
@@ -379,6 +442,31 @@ class Failures(LaneTest):
         control.send(task_id, "please finish now")
         self.status_is(task_id, "review")
 
+    def test_events_from_while_the_supervisor_was_down_are_read(self):
+        task_id = self.start("wait", max_retries=3)
+        found = self.session_up(task_id)
+        pid = self.task(task_id).worker_pid
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        # the agent finishes while nobody watches
+        subprocess.run(["tmux", "-L", tmux.socket_name(), "send-keys", "-t", found["tmux"], "please finish now", "Enter"])
+        time.sleep(1)
+        self.sweep_until_crashed(task_id)
+        self.assertIn(task_id, spawn.tick())
+        self.status_is(task_id, "review")
+
+    def test_killed_supervisor_after_an_earlier_clean_run_is_still_a_crash(self):
+        task_id = self.start("wait", max_retries=3)
+        self.session_up(task_id)
+        control.stop(task_id)
+        control.resume(task_id, "keep waiting")
+        self.session_up(task_id)
+        pid = wait_for(lambda: self.task(task_id).worker_pid, what="pid")
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        self.sweep_until_crashed(task_id)
+        self.assertEqual(self.run_row(task_id).outcome, "crashed")
+
     def test_max_runtime_ends_the_session(self):
         task_id = self.start("hang", max_runtime_seconds=1, max_retries=3)
         found = wait_for(lambda: store.load(task_id), what="session")
@@ -394,15 +482,15 @@ class Commands(unittest.TestCase):
     def test_no_bypass_flag_is_ever_built(self):
         for cls in agents.AGENTS.values():
             for resuming in (False, True):
-                argv = cls({}).command(self.session, "go", ["hook"], resuming)
+                argv = cls({}).command(self.session, ["hook"], resuming)
                 joined = " ".join(argv)
                 self.assertNotIn("dangerously", joined)
                 self.assertNotIn("bypass", joined.lower())
 
     def test_prompt_cannot_be_read_as_a_flag_value(self):
         for cls in agents.AGENTS.values():
-            argv = cls({"claude": {"allowed_tools": ["Read"]}}).command(self.session, "go", ["hook"], False)
-            self.assertEqual(argv[-2:], ["--", "go"])
+            argv = cls({"claude": {"allowed_tools": ["Read"]}}).command(self.session, ["hook"], False)
+            self.assertEqual(argv[-1], "--")
 
     def test_bypass_settings_are_refused(self):
         with self.assertRaises(agents.ConfigError):
@@ -428,6 +516,9 @@ class Commands(unittest.TestCase):
         self.assertTrue(tmux.at_dialog("Trust this folder?\n› 1. Trust and continue\n  2. Quit"))
         self.assertFalse(tmux.at_dialog("❯ 1. first thing I typed\nanswer\n❯ "))
         self.assertFalse(tmux.at_dialog("no box yet"))
+        self.assertTrue(tmux.at_dialog(" ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel"))
+        self.assertTrue(tmux.at_dialog("› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit"))
+        self.assertFalse(tmux.at_dialog("the docs say press enter to confirm\nmore output\nx\ny\nz\nw\nv\n❯ "))
 
 
 def tearDownModule():

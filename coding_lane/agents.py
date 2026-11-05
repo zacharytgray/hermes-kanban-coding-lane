@@ -68,9 +68,10 @@ class Claude:
         except ValueError:
             return None  # a cli without this subcommand, let the session report it
 
-    def command(self, session, prompt, hook, resuming):
+    def command(self, session, hook, resuming):
+        """argv up to the prompt, which the pane appends after the --"""
         events = {e: [{"hooks": [{"type": "command", "command": _shell(hook)}]}]
-                  for e in ("Stop", "StopFailure", "Notification")}
+                  for e in ("Stop", "StopFailure", "Notification", "UserPromptSubmit")}
         argv = [self.bin, "--permission-mode", self.mode, "--settings", json.dumps({"hooks": events}),
                 "--remote-control", session["tmux"]]
         argv += ["--resume", session["session_id"]] if resuming else ["--session-id", session["session_id"]]
@@ -81,7 +82,7 @@ class Claude:
         if self.cfg.get("allowed_tools"):
             argv += ["--allowedTools", ",".join(self.cfg["allowed_tools"])]
         # --allowedTools takes many values and would swallow a bare prompt
-        return [*argv, "--", prompt]
+        return [*argv, "--"]
 
     def has_transcript(self, session):
         root = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
@@ -115,6 +116,9 @@ class Claude:
     def needs_approval(self, event):
         return event.get("hook_event_name") == "Notification" and event.get("notification_type") == "permission_prompt"
 
+    def prompt_submitted(self, event):
+        return event.get("hook_event_name") == "UserPromptSubmit"
+
 
 class Codex:
     name = "codex"
@@ -136,7 +140,7 @@ class Codex:
         out = subprocess.run([self.bin, "login", "status"], capture_output=True, text=True, env=env, timeout=30)
         return None if out.returncode == 0 else "codex is not logged in. run: codex login"
 
-    def command(self, session, prompt, hook, resuming):
+    def command(self, session, hook, resuming):
         argv = [self.bin]
         if resuming:
             argv += ["resume", session["session_id"]]
@@ -144,7 +148,7 @@ class Codex:
                  "--ask-for-approval", self.approval, "-c", "notify=" + json.dumps(hook)]
         if self.cfg.get("model"):
             argv += ["--model", self.cfg["model"]]
-        return [*argv, "--", prompt]
+        return [*argv, "--"]
 
     def has_transcript(self, session):
         return bool(session.get("session_id"))
@@ -184,6 +188,9 @@ class Codex:
     def needs_approval(self, event):
         return False
 
+    def prompt_submitted(self, event):
+        return False
+
 
 AGENTS = {Claude.name: Claude, Codex.name: Codex}
 
@@ -197,7 +204,9 @@ def _shell(argv):
 
 
 def at_trust_prompt(screen):
-    return "trust this folder" in screen.lower()
+    """the trust dialog itself, not the phrase quoted in a card or a reply"""
+    bottom = "\n".join(screen.rstrip().splitlines()[-15:])
+    return tmux.at_dialog(screen) and "trust this folder" in bottom.lower()
 
 
 def classify_failure(screen):

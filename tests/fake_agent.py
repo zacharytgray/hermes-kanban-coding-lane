@@ -13,6 +13,29 @@ def flag(args, name):
     return args[args.index(name) + 1] if name in args else None
 
 
+def read_line():
+    """one line in cbreak mode with our own echo. a cooked tty caps a line near 1 kb, a real cli does not"""
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    chars = []
+    try:
+        while True:
+            ch = os.read(fd, 1).decode(errors="replace")
+            if not ch:
+                return None
+            if ch in "\r\n":
+                print(flush=True)
+                return "".join(chars)
+            chars.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def main():
     args = sys.argv[1:]
     if args[:2] in (["auth", "status"], ["login", "status"]):
@@ -55,7 +78,9 @@ def main():
     with open("argv.json", "w") as f:
         json.dump({"args": args[:-1], "prompt": prompt, "env": dict(os.environ)}, f)
 
-    if scenario == "resumed":
+    if scenario == "resumed" and "keep waiting" in prompt:
+        record("resumed and waiting: " + prompt)
+    elif scenario == "resumed":
         record("resumed: " + prompt)
         end_turn("picked up where I left off\nLANE-STATUS: done")
     elif scenario == "done":
@@ -85,6 +110,11 @@ def main():
         sys.stdin.readline()
         record("trusted")
         end_turn("Trusted and done.\nLANE-STATUS: done")
+    elif scenario == "trust_claude":
+        print(" Quick safety check: Is this a project you trust?\n ❯ No, exit\n   Yes, I trust this folder\n"
+              " Enter to confirm · Esc to cancel", flush=True)
+        sys.stdin.readline()
+        sys.exit(1)
     elif scenario == "dialog":
         print("Do you want to proceed?\n❯ 1. Yes\n  2. No", flush=True)
         fire("Notification", notification_type="permission_prompt")
@@ -93,8 +123,8 @@ def main():
     # stay interactive, like a real session waiting for its next message
     while True:
         box()
-        line = sys.stdin.readline()
-        if not line:
+        line = read_line()
+        if line is None:
             return
         record(line.strip())
         if "finish" in line:

@@ -59,9 +59,10 @@ class Supervisor:
         self.steer_authors = set(self.settings.get("steer_authors") or [])
         self.auto_trust = bool(self.settings.get("auto_trust", False))
         self.events_path = store.events_path(task_id, board)
-        self.events_read = self.events_path.stat().st_size if self.events_path.exists() else 0
         self.waiting = False
+        self.waiting_wall = 0.0
         self.dialog_noted = False
+        self.trust_answered = False
         self.last_activity = time.monotonic()
         self.last_hash = ""
         self.started = time.monotonic()
@@ -82,29 +83,35 @@ class Supervisor:
             return self.watch()
 
     def open_session(self, task, env):
-        fresh = store.load(self.task_id, self.board) is None
-        self.session = store.load(self.task_id, self.board) or {
+        saved = store.load(self.task_id, self.board)
+        if saved and saved["agent"] != self.agent.name:
+            log(f"card moved from {saved['agent']} to {self.agent.name}, starting a new session")
+            saved = None
+        self.session = saved or {
             "task_id": self.task_id, "agent": self.agent.name, "tmux": f"lane-{self.task_id}",
             "worktree": str(self.workspace),
             "branch": git(self.workspace, "branch", "--show-current").stdout.strip(),
             "base": git(self.workspace, "rev-parse", "HEAD").stdout.strip(),
             "session_id": self.agent.new_session_id(), "link": None, "comment_after": 0, "note": None,
         }
-        store.stop_path(self.task_id, self.board).unlink(missing_ok=True)
         name = self.session["tmux"]
         if tmux.exists(name) and tmux.pane_exit(name) is None:
-            # the last supervisor died and the session kept working
+            # the last supervisor died and the session kept working. read the events it missed
             log(f"adopting running session {name}")
+            self.events_read = self.session.get("events_read", 0)
             return
         tmux.kill(name)
-        resuming = not fresh and self.agent.has_transcript(self.session)
+        resuming = saved is not None and self.agent.has_transcript(self.session)
         prompt = self.resume_prompt() if resuming else self.first_prompt(task)
-        self.session["note"] = None
-        self.session["link"] = None  # remote control hands out a new link per process
-        self.session["comment_after"] = kanban.last_comment_id(self.conn, self.task_id)
-        store.save(self.session, self.board)
+        store.prompt_path(self.task_id, self.board).write_text(prompt)
+        self.events_read = self.events_path.stat().st_size if self.events_path.exists() else 0
         hook = agents.hook_command(self.events_path)
-        tmux.start(name, self.workspace, self.agent.command(self.session, prompt, hook, resuming), env)
+        tmux.start(name, self.workspace, self.agent.command(self.session, hook, resuming),
+                   env, store.prompt_path(self.task_id, self.board))
+        # cleared only once the cli has them, so a failed start keeps the note for the retry
+        self.session.update(note=None, link=None, events_read=self.events_read,
+                            comment_after=kanban.last_comment_id(self.conn, self.task_id))
+        store.save(self.session, self.board)
         log(f"started {self.agent.name} in {name}, resuming={resuming}")
         self.post_handles()
 
@@ -135,10 +142,21 @@ class Supervisor:
         kanban.comment(self.conn, self.task_id, "\n".join(lines))
 
     def note_dialog(self, screen):
-        if tmux.at_dialog(screen) and not self.dialog_noted:
+        if not tmux.at_dialog(screen):
+            self.dialog_noted = False  # so the next dialog gets its own comment
+        elif not self.dialog_noted:
             self.dialog_noted = True
             kanban.comment(self.conn, self.task_id, "waiting at a dialog in the session. "
-                           f"answer it from: {tmux.attach_command(self.session['tmux'])}")
+                           f"answer it from the session link or: {tmux.attach_command(self.session['tmux'])}")
+
+    def wait_for_person(self):
+        self.waiting, self.waiting_wall = True, time.time()
+
+    def check_answered(self):
+        """a person typed or sent something since the agent stopped"""
+        steered = store.steered_path(self.task_id, self.board)
+        if self.waiting and steered.exists() and steered.stat().st_mtime > self.waiting_wall:
+            self.waiting = False
 
     def discover(self, screen):
         changed = False
@@ -164,6 +182,9 @@ class Supervisor:
             f.seek(self.events_read)
             lines = f.readlines()
             self.events_read = f.tell()
+        if lines:
+            self.session["events_read"] = self.events_read
+            store.save(self.session, self.board)
         return [json.loads(line) for line in lines if line.strip()]
 
     def watch(self):
@@ -183,21 +204,23 @@ class Supervisor:
             if stop.exists():
                 reason = stop.read_text().strip() or "no reason given"
                 stop.unlink()
-                return self.end_blocked(f"stopped by the operator: {reason}", "needs_input")
+                return self.end_parked(f"stopped by the operator: {reason}")
 
             screen = tmux.pane(name)
             exit_code = tmux.pane_exit(name)
             if exit_code is not None or not tmux.exists(name):
                 return self.session_ended(exit_code, screen)
-            if now - self.started < STARTUP_SECONDS and agents.at_trust_prompt(screen):
+            if now - self.started < STARTUP_SECONDS and not self.trust_answered and agents.at_trust_prompt(screen):
                 if not self.auto_trust:
                     return self.end_blocked(f"{self.agent.bin} does not trust this repo yet. run it once in "
                                             "the repo and accept, or set auto_trust, then resume.", "capability")
                 log("accepting the trust prompt for this repo")
                 self.agent.accept_trust(name, screen)
+                self.trust_answered = True
                 time.sleep(self.poll)
                 continue
             self.note_dialog(screen)
+            self.check_answered()
             self.discover(screen)
 
             for event in self.read_events():
@@ -231,18 +254,17 @@ class Supervisor:
             log(f"turn failed: {failed}")
             return None
         if self.agent.needs_approval(event):
-            self.waiting = True
-            if not self.dialog_noted:
-                self.dialog_noted = True
-                kanban.comment(self.conn, self.task_id, "waiting at an approval prompt. "
-                               f"answer it from the session link or: {tmux.attach_command(self.session['tmux'])}")
+            self.wait_for_person()
+            return None  # note_dialog comments once the prompt is on screen
+        if self.agent.prompt_submitted(event):
+            self.waiting = False
             return None
         if not self.agent.turn_ended(event):
             return None
         message = self.agent.last_message(event)
         found = agents.STATUS_LINE.findall(message)
         if not found:
-            self.waiting = True
+            self.wait_for_person()
             return None
         state, detail = found[-1]
         if state == "done":
@@ -253,8 +275,10 @@ class Supervisor:
         if not self.steer_authors or tmux.at_dialog(screen):
             return
         for author, body in self.new_comments():
+            # deliver checks for a dialog again right before each enter
             result = tmux.deliver(name, f"Comment from {author}. The author label is not verified: {body}")
-            self.waiting = False
+            if result == "sent":
+                self.waiting = False
             log(f"comment from {author} delivery: {result}")
 
     def session_ended(self, exit_code, screen):
@@ -274,6 +298,12 @@ class Supervisor:
                    "quota": ("the cli hit a usage limit. resume this card after it resets.", "transient")}
         reason, kind = reasons[failure]
         return self.end_blocked(f"{reason}\n{tail(detail, 6)}", kind)
+
+    def end_parked(self, reason):
+        log(f"parking: {reason}")
+        tmux.kill(self.session["tmux"])
+        kanban.park(self.conn, self.task_id, self.run_id, reason)
+        return 0
 
     def end_blocked(self, reason, kind):
         log(f"blocking: {reason}")
@@ -324,6 +354,9 @@ def main(argv):
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, on_term)
+    # the dispatcher reads the last exit line in the log. until this run writes its own,
+    # a killed supervisor should read as a crash, not as the previous run's exit
+    print(f"{kanban.EXIT_TRAILER}1", flush=True)
     code = 1
     try:
         code = supervisor.run()
