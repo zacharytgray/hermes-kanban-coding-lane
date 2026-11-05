@@ -1,0 +1,22 @@
+name: coding-lane
+version: 0.1.0
+description: Run Claude Code and Codex as steerable Hermes kanban workers, each in its own worktree and tmux session
+author: zacharytgray
+kind: standalone
+manifest_version: 2
+license: MIT
+platforms: [darwin, linux]
+requires_hermes: ">=0.22.5"
+provides_hooks: [on_kanban_dispatch_tick]
+provides_tools: [coding_lane_status, coding_lane_send, coding_lane_stop, coding_lane_resume]
+config_schema:
+  max_running: {type: int, default: 2, description: "most lane sessions running at once on a board"}
+  poll_seconds: {type: float, default: 5, description: "how often a supervisor checks its session"}
+  stuck_seconds: {type: int, default: 1200, description: "block a session with no activity for this long"}
+  idle_seconds: {type: int, default: 1800, description: "block a session waiting on a person for this long"}
+  quiet_failure_seconds: {type: float, default: 30, description: "how long a pane stays quiet before it is checked for auth and quota errors"}
+  auto_trust: {type: bool, default: false, description: "answer the cli's trust prompt for a card's repo. the cli saves that answer in its own config"}
+  steer_authors: {type: list, default: [], description: "comment authors whose new comments reach the live CLI"}
+  env_passthrough: {type: list, default: [], description: "extra env vars the CLI may see, such as ANTHROPIC_API_KEY"}
+  claude: {type: dict, default: {}, description: "bin, model, effort, permission_mode, allowed_tools"}
+  codex: {type: dict, default: {}, description: "bin, model, sandbox, approval"}
